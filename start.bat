@@ -124,24 +124,18 @@ param(
     [string]$Endpoint = 'https://discord.com/api/v9/unique-username/username-attempt-unauthed'
 )
 
+$SCRIPT_VERSION = 'v4-httpwebrequest'
+
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# --- FIX : charger System.Net.Http explicitement (absent du runspace par defaut en PS 5.1)
-function Load-HttpAssembly {
-    if ('System.Net.Http.HttpClient' -as [type]) { return }
-    try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
-    if (-not ('System.Net.Http.HttpClient' -as [type])) {
-        try { [void][System.Reflection.Assembly]::LoadWithPartialName('System.Net.Http') } catch { }
-    }
-    if (-not ('System.Net.Http.HttpClient' -as [type])) {
-        try { [void][System.Reflection.Assembly]::Load('System.Net.Http, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a') } catch { }
-    }
-}
-Load-HttpAssembly
+[Net.ServicePointManager]::Expect100Continue = $false
+[Net.ServicePointManager]::DefaultConnectionLimit = 100
+[Net.WebRequest]::DefaultWebProxy = $null
 
 if ($Threads -lt 1) { $Threads = 1 }
 if ($DelayMs -lt 0) { $DelayMs = 0 }
+
+$UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 $root = Join-Path $env:TEMP 'discord-name-checker'
 [void][IO.Directory]::CreateDirectory($root)
@@ -182,38 +176,26 @@ $todo = 0
 foreach ($n in $all) { if (-not $checked.Contains($n)) { $queue.Enqueue($n); $todo++ } }
 
 Write-Host ""
+Write-Host "  Script     : $SCRIPT_VERSION"
 Write-Host "  PowerShell : $($PSVersionTable.PSVersion)"
 Write-Host "  Cible      : $tag   ($($all.Length) pseudos au total)"
 Write-Host "  A verifier : $todo"
 if ($todo -eq 0) { Write-Host "  Tout est deja verifie."; return }
 Write-Host "  Fichier    : $okFile"
 Write-Host "  Cadence    : 1 verification toutes les $DelayMs ms  (threads: $Threads)"
-
-# ---------- webhook (init securisee) ----------
-$script:nextSend = [DateTime]::UtcNow
-$whClient = $null
-if ($Webhook) {
-    try {
-        $whHandler = New-Object System.Net.Http.HttpClientHandler
-        try { $whHandler.UseProxy = $false } catch { }
-        $whClient = New-Object System.Net.Http.HttpClient($whHandler)
-        $whClient.Timeout = [TimeSpan]::FromSeconds(20)
-        Write-Host "  Webhook    : actif"
-    } catch {
-        Write-Host "  Webhook    : desactive ($($_.Exception.Message))"
-        $whClient = $null
-        $Webhook  = ''
-    }
-} else {
-    Write-Host "  Webhook    : desactive"
-}
+if ($Webhook) { Write-Host "  Webhook    : actif" } else { Write-Host "  Webhook    : desactive" }
 Write-Host ""
+
+# ---------- webhook ----------
+$script:nextSend = [DateTime]::UtcNow
 
 function Send-Embed {
     param([string]$Title, [string]$Desc, [int]$Color)
-    if (-not $whClient) { return }
+    if (-not $Webhook) { return }
+
     $gap = ($script:nextSend - [DateTime]::UtcNow).TotalMilliseconds
     if ($gap -gt 0) { Start-Sleep -Milliseconds ([int]$gap) }
+
     $payload = @{
         content = "**$Title** disponible"
         embeds  = @(@{
@@ -227,11 +209,37 @@ function Send-Embed {
 
     for ($t = 0; $t -lt 5; $t++) {
         try {
-            $c = New-Object System.Net.Http.StringContent($payload, [Text.Encoding]::UTF8, 'application/json')
-            $r = $whClient.PostAsync($Webhook, $c).GetAwaiter().GetResult()
-            $code = [int]$r.StatusCode
-            $body = $r.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            $c.Dispose()
+            $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+            $req = [System.Net.HttpWebRequest]::Create($Webhook)
+            $req.Method = 'POST'
+            $req.ContentType = 'application/json'
+            $req.UserAgent = 'DiscordNameChecker'
+            $req.Timeout = 20000
+            $req.ReadWriteTimeout = 20000
+            $req.KeepAlive = $false
+            $req.Proxy = $null
+            $req.ContentLength = $bytes.Length
+
+            $st = $req.GetRequestStream()
+            $st.Write($bytes, 0, $bytes.Length)
+            $st.Close()
+
+            $resp = $null
+            try { $resp = $req.GetResponse() }
+            catch [System.Net.WebException] {
+                if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw }
+            }
+
+            $code = 0
+            $body = ''
+            if ($resp) {
+                $code = [int]$resp.StatusCode
+                $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                $body = $sr.ReadToEnd()
+                $sr.Close()
+                $resp.Close()
+            }
+
             if ($code -eq 429) {
                 $ms = 2500
                 if ($body -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 300 }
@@ -239,12 +247,14 @@ function Send-Embed {
                 continue
             }
             break
-        } catch { Start-Sleep -Milliseconds 800 }
+        } catch {
+            Start-Sleep -Milliseconds 800
+        }
     }
     $script:nextSend = [DateTime]::UtcNow.AddSeconds(2)
 }
 
-if ($whClient) { Send-Embed -Title "Demarrage" -Desc "Verification des pseudos **$tag** en cours..." -Color 3447003 }
+if ($Webhook) { Send-Embed -Title "Demarrage" -Desc "Verification des pseudos **$tag** en cours..." -Color 3447003 }
 
 # ---------- regulateur global : 1 requete toutes les DelayMs ----------
 $sync = @{ lock = (New-Object System.Object); next = [DateTime]::UtcNow }
@@ -257,35 +267,10 @@ $pool    = [runspacefactory]::CreateRunspacePool(1, $Threads)
 $pool.Open()
 
 $sb = {
-    param($queue, $results, $hits, $done, $endpoint, $delay, $sync, $idx)
-
-    if (-not ('System.Net.Http.HttpClient' -as [type])) {
-        try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
-        if (-not ('System.Net.Http.HttpClient' -as [type])) {
-            try { [void][System.Reflection.Assembly]::LoadWithPartialName('System.Net.Http') } catch { }
-        }
-    }
-
-    $client  = $null
+    param($queue, $results, $hits, $done, $endpoint, $delay, $sync, $ua, $idx)
     $lockObj = $sync['lock']
     $item    = ''
     try {
-        # client HTTP, avec repli si le handler n'est pas dispo
-        try {
-            $handler = New-Object System.Net.Http.HttpClientHandler
-            try { $handler.MaxConnectionsPerServer = 64 } catch { }
-            try { $handler.UseProxy = $false } catch { }
-            try { $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate } catch { }
-            $client = New-Object System.Net.Http.HttpClient($handler)
-        } catch {
-            $client = New-Object System.Net.Http.HttpClient
-        }
-        $client.Timeout = [TimeSpan]::FromSeconds(25)
-        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
-        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Origin','https://discord.com')
-        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Referer','https://discord.com/register')
-        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept','application/json')
-
         while ($queue.TryDequeue([ref]$item)) {
 
             # -- reservation du creneau : exactement 1 envoi toutes les $delay ms
@@ -301,16 +286,47 @@ $sb = {
 
             $name   = $item
             $status = 'err'
+
             for ($t = 0; $t -lt 8; $t++) {
                 try {
-                    $body    = '{"username":"' + $name + '"}'
-                    $content = New-Object System.Net.Http.StringContent($body, [Text.Encoding]::UTF8, 'application/json')
-                    $r       = $client.PostAsync($endpoint, $content).GetAwaiter().GetResult()
-                    $code    = [int]$r.StatusCode
-                    $txt     = $r.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                    $content.Dispose()
+                    $bytes = [Text.Encoding]::UTF8.GetBytes('{"username":"' + $name + '"}')
+
+                    $req = [System.Net.HttpWebRequest]::Create($endpoint)
+                    $req.Method = 'POST'
+                    $req.ContentType = 'application/json'
+                    $req.UserAgent = $ua
+                    $req.Accept = 'application/json'
+                    $req.Referer = 'https://discord.com/register'
+                    try { $req.Headers.Add('Origin', 'https://discord.com') } catch { }
+                    $req.Timeout = 25000
+                    $req.ReadWriteTimeout = 25000
+                    $req.KeepAlive = $false
+                    $req.Proxy = $null
+                    $req.ContentLength = $bytes.Length
+
+                    $st = $req.GetRequestStream()
+                    $st.Write($bytes, 0, $bytes.Length)
+                    $st.Close()
+
+                    $resp = $null
+                    try { $resp = $req.GetResponse() }
+                    catch [System.Net.WebException] {
+                        if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw }
+                    }
+
+                    $code = 0
+                    $txt  = ''
+                    if ($resp) {
+                        $code = [int]$resp.StatusCode
+                        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                        $txt = $sr.ReadToEnd()
+                        $sr.Close()
+                        $resp.Close()
+                    }
+
                     if ($txt -match '"taken"\s*:\s*true')  { $status = 'pris';  break }
                     if ($txt -match '"taken"\s*:\s*false') { $status = 'dispo'; break }
+
                     if ($code -eq 429) {
                         $ms = 1500
                         if ($txt -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 250 }
@@ -324,13 +340,13 @@ $sb = {
                     Start-Sleep -Milliseconds 700
                 }
             }
+
             if ($status -eq 'dispo') { $hits.Enqueue($name) }
             $results.Enqueue($name + [char]9 + $status)
         }
     } catch {
         $results.Enqueue("ERREUR_WORKER$idx" + [char]9 + "err")
     } finally {
-        if ($client) { try { $client.Dispose() } catch { } }
         $done.Enqueue($idx)
     }
 }
@@ -339,7 +355,7 @@ $handles = New-Object System.Collections.ArrayList
 for ($i = 0; $i -lt $Threads; $i++) {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $pool
-    [void]$ps.AddScript($sb).AddArgument($queue).AddArgument($results).AddArgument($hits).AddArgument($done).AddArgument($Endpoint).AddArgument($DelayMs).AddArgument($sync).AddArgument($i)
+    [void]$ps.AddScript($sb).AddArgument($queue).AddArgument($results).AddArgument($hits).AddArgument($done).AddArgument($Endpoint).AddArgument($DelayMs).AddArgument($sync).AddArgument($UA).AddArgument($i)
     try { [void]$handles.Add([pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() }) }
     catch { $done.Enqueue($i) }
 }
@@ -389,7 +405,6 @@ try {
     foreach ($h in $handles) { try { [void]$h.PS.EndInvoke($h.H) } catch { }; try { $h.PS.Dispose() } catch { } }
     try { $pool.Close() } catch { }
     try { $pool.Dispose() } catch { }
-    if ($whClient) { try { $whClient.Dispose() } catch { } }
 }
 
 Write-Host ""
@@ -398,6 +413,6 @@ Write-Host "  Termine : $processed verifies, $found disponibles."
 Write-Host "  Disponibles : $okFile"
 Write-Host "  Journal     : $logFile"
 
-if ($whClient) {
+if ($Webhook) {
     Send-Embed -Title "Termine" -Desc "**$tag** : $processed pseudos verifies, **$found** disponibles." -Color 10181046
 }

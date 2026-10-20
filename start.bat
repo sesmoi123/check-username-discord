@@ -127,6 +127,19 @@ param(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# --- FIX : charger System.Net.Http explicitement (absent du runspace par defaut en PS 5.1)
+function Load-HttpAssembly {
+    if ('System.Net.Http.HttpClient' -as [type]) { return }
+    try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
+    if (-not ('System.Net.Http.HttpClient' -as [type])) {
+        try { [void][System.Reflection.Assembly]::LoadWithPartialName('System.Net.Http') } catch { }
+    }
+    if (-not ('System.Net.Http.HttpClient' -as [type])) {
+        try { [void][System.Reflection.Assembly]::Load('System.Net.Http, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a') } catch { }
+    }
+}
+Load-HttpAssembly
+
 if ($Threads -lt 1) { $Threads = 1 }
 if ($DelayMs -lt 0) { $DelayMs = 0 }
 
@@ -169,27 +182,36 @@ $todo = 0
 foreach ($n in $all) { if (-not $checked.Contains($n)) { $queue.Enqueue($n); $todo++ } }
 
 Write-Host ""
+Write-Host "  PowerShell : $($PSVersionTable.PSVersion)"
 Write-Host "  Cible      : $tag   ($($all.Length) pseudos au total)"
 Write-Host "  A verifier : $todo"
 if ($todo -eq 0) { Write-Host "  Tout est deja verifie."; return }
 Write-Host "  Fichier    : $okFile"
 Write-Host "  Cadence    : 1 verification toutes les $DelayMs ms  (threads: $Threads)"
-if ($Webhook) { Write-Host "  Webhook    : actif" } else { Write-Host "  Webhook    : desactive" }
-Write-Host ""
 
-# ---------- webhook ----------
+# ---------- webhook (init securisee) ----------
 $script:nextSend = [DateTime]::UtcNow
 $whClient = $null
 if ($Webhook) {
-    $whHandler = New-Object System.Net.Http.HttpClientHandler
-    $whHandler.UseProxy = $false
-    $whClient = New-Object System.Net.Http.HttpClient($whHandler)
-    $whClient.Timeout = [TimeSpan]::FromSeconds(20)
+    try {
+        $whHandler = New-Object System.Net.Http.HttpClientHandler
+        try { $whHandler.UseProxy = $false } catch { }
+        $whClient = New-Object System.Net.Http.HttpClient($whHandler)
+        $whClient.Timeout = [TimeSpan]::FromSeconds(20)
+        Write-Host "  Webhook    : actif"
+    } catch {
+        Write-Host "  Webhook    : desactive ($($_.Exception.Message))"
+        $whClient = $null
+        $Webhook  = ''
+    }
+} else {
+    Write-Host "  Webhook    : desactive"
 }
+Write-Host ""
 
 function Send-Embed {
     param([string]$Title, [string]$Desc, [int]$Color)
-    if (-not $Webhook) { return }
+    if (-not $whClient) { return }
     $gap = ($script:nextSend - [DateTime]::UtcNow).TotalMilliseconds
     if ($gap -gt 0) { Start-Sleep -Milliseconds ([int]$gap) }
     $payload = @{
@@ -222,7 +244,7 @@ function Send-Embed {
     $script:nextSend = [DateTime]::UtcNow.AddSeconds(2)
 }
 
-if ($Webhook) { Send-Embed -Title "Demarrage" -Desc "Verification des pseudos **$tag** en cours..." -Color 3447003 }
+if ($whClient) { Send-Embed -Title "Demarrage" -Desc "Verification des pseudos **$tag** en cours..." -Color 3447003 }
 
 # ---------- regulateur global : 1 requete toutes les DelayMs ----------
 $sync = @{ lock = (New-Object System.Object); next = [DateTime]::UtcNow }
@@ -236,19 +258,34 @@ $pool.Open()
 
 $sb = {
     param($queue, $results, $hits, $done, $endpoint, $delay, $sync, $idx)
-    $handler = New-Object System.Net.Http.HttpClientHandler
-    $handler.MaxConnectionsPerServer = 64
-    $handler.UseProxy = $false
-    try { $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate } catch { }
-    $client = New-Object System.Net.Http.HttpClient($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(25)
-    [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
-    [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Origin','https://discord.com')
-    [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Referer','https://discord.com/register')
-    [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept','application/json')
+
+    if (-not ('System.Net.Http.HttpClient' -as [type])) {
+        try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
+        if (-not ('System.Net.Http.HttpClient' -as [type])) {
+            try { [void][System.Reflection.Assembly]::LoadWithPartialName('System.Net.Http') } catch { }
+        }
+    }
+
+    $client  = $null
     $lockObj = $sync['lock']
-    $item = ''
+    $item    = ''
     try {
+        # client HTTP, avec repli si le handler n'est pas dispo
+        try {
+            $handler = New-Object System.Net.Http.HttpClientHandler
+            try { $handler.MaxConnectionsPerServer = 64 } catch { }
+            try { $handler.UseProxy = $false } catch { }
+            try { $handler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate } catch { }
+            $client = New-Object System.Net.Http.HttpClient($handler)
+        } catch {
+            $client = New-Object System.Net.Http.HttpClient
+        }
+        $client.Timeout = [TimeSpan]::FromSeconds(25)
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Origin','https://discord.com')
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Referer','https://discord.com/register')
+        [void]$client.DefaultRequestHeaders.TryAddWithoutValidation('Accept','application/json')
+
         while ($queue.TryDequeue([ref]$item)) {
 
             # -- reservation du creneau : exactement 1 envoi toutes les $delay ms
@@ -290,8 +327,10 @@ $sb = {
             if ($status -eq 'dispo') { $hits.Enqueue($name) }
             $results.Enqueue($name + [char]9 + $status)
         }
+    } catch {
+        $results.Enqueue("ERREUR_WORKER$idx" + [char]9 + "err")
     } finally {
-        $client.Dispose()
+        if ($client) { try { $client.Dispose() } catch { } }
         $done.Enqueue($idx)
     }
 }
@@ -301,7 +340,8 @@ for ($i = 0; $i -lt $Threads; $i++) {
     $ps = [powershell]::Create()
     $ps.RunspacePool = $pool
     [void]$ps.AddScript($sb).AddArgument($queue).AddArgument($results).AddArgument($hits).AddArgument($done).AddArgument($Endpoint).AddArgument($DelayMs).AddArgument($sync).AddArgument($i)
-    [void]$handles.Add([pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() })
+    try { [void]$handles.Add([pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() }) }
+    catch { $done.Enqueue($i) }
 }
 
 $okW  = New-Object System.IO.StreamWriter($okFile, $true)
@@ -319,7 +359,7 @@ try {
         while ($n -lt 4000 -and $results.TryDequeue([ref]$line)) {
             $p = $line.IndexOf([char]9)
             $logW.WriteLine($line)
-            if ($line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
+            if ($p -gt 0 -and $line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
             $processed++; $n++
         }
         if ($n -gt 0) { $logW.Flush(); $okW.Flush() }
@@ -338,7 +378,7 @@ try {
     while ($results.TryDequeue([ref]$line)) {
         $p = $line.IndexOf([char]9)
         $logW.WriteLine($line)
-        if ($line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
+        if ($p -gt 0 -and $line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
         $processed++
     }
     while ($hits.TryDequeue([ref]$hitName)) {
@@ -358,6 +398,6 @@ Write-Host "  Termine : $processed verifies, $found disponibles."
 Write-Host "  Disponibles : $okFile"
 Write-Host "  Journal     : $logFile"
 
-if ($Webhook) {
+if ($whClient) {
     Send-Embed -Title "Termine" -Desc "**$tag** : $processed pseudos verifies, **$found** disponibles." -Color 10181046
 }

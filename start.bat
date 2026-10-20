@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-set "VER=6"
+set "VER=7"
 title Checker pseudo Discord - 3L 3C 4L 4C
 color 0B
 
@@ -32,9 +32,6 @@ echo     [W]  Webhook                : %WEBHOOK%
 echo     [O]  Ouvrir le dossier des resultats
 echo     [R]  Repartir de zero (efface la progression)
 echo     [Q]  Quitter
-echo.
-echo   Astuce : si la fenetre se fige, desactive le "Mode selection rapide"
-echo            dans les proprietes de la console (clic droit sur la barre).
 echo.
 set "c="
 set /p "c=   Ton choix : "
@@ -140,16 +137,17 @@ param(
     [string]$Endpoint = 'https://discord.com/api/v9/unique-username/username-attempt-unauthed'
 )
 
-$SCRIPT_VERSION = 'v6-adaptive'
+$SCRIPT_VERSION = 'v7-robuste'
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::Expect100Continue = $false
 [Net.ServicePointManager]::DefaultConnectionLimit = 200
-[Net.WebRequest]::DefaultWebProxy = $null
 
 if ($Threads -lt 1) { $Threads = 1 }
 if ($DelayMs -lt 0) { $DelayMs = 0 }
+
+$HARD_MS = 10000
 
 $UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
@@ -161,6 +159,61 @@ $listFile = Join-Path $root "liste_$tag.txt"
 $okFile   = Join-Path $root "dispo_$tag.txt"
 $logFile  = Join-Path $root "verif_$tag.txt"
 
+Write-Host ""
+Write-Host "  Script     : $SCRIPT_VERSION"
+Write-Host "  PowerShell : $($PSVersionTable.PSVersion)"
+
+# ================== AUTO-TEST DE CONNEXION ==================
+$proxyMode = 'none'
+
+function Test-Ping {
+    param([string]$Url, [string]$Mode, [string]$Ua)
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes('{"username":"zzzqzzzq"}')
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json'
+        $req.UserAgent = $Ua
+        $req.Accept = 'application/json'
+        $req.Timeout = 8000
+        $req.ReadWriteTimeout = 8000
+        if ($Mode -eq 'system') { $req.Proxy = [System.Net.WebRequest]::GetSystemWebProxy() } else { $req.Proxy = $null }
+        $req.ContentLength = $bytes.Length
+        $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
+
+        $ar = $req.BeginGetResponse($null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne(9000)) { try { $req.Abort() } catch { }; return @{ ok = $false; code = 0; msg = 'delai depasse' } }
+        $resp = $null
+        try { $resp = $req.EndGetResponse($ar) }
+        catch [System.Net.WebException] {
+            if ($_.Exception.Response) { $resp = $_.Exception.Response }
+            else { return @{ ok = $false; code = 0; msg = $_.Exception.Message } }
+        }
+        if ($resp) { $c = [int]$resp.StatusCode; $resp.Close(); return @{ ok = $true; code = $c; msg = '' } }
+        return @{ ok = $false; code = 0; msg = 'pas de reponse' }
+    } catch {
+        return @{ ok = $false; code = 0; msg = $_.Exception.Message }
+    }
+}
+
+Write-Host "  Test de connexion a Discord..."
+$ping = Test-Ping -Url $Endpoint -Mode 'none' -Ua $UA
+if ($ping.ok) {
+    Write-Host "  Connexion  : OK  (direct, HTTP $($ping.code))"
+} else {
+    Write-Host "  Connexion  : echec en direct -> $($ping.msg)"
+    Write-Host "  Tentative via le proxy systeme..."
+    $ping2 = Test-Ping -Url $Endpoint -Mode 'system' -Ua $UA
+    if ($ping2.ok) {
+        $proxyMode = 'system'
+        Write-Host "  Connexion  : OK  (proxy systeme, HTTP $($ping2.code))"
+    } else {
+        Write-Host "  Connexion  : echec aussi via proxy -> $($ping2.msg)"
+        Write-Host "  On continue quand meme (les echecs seront rattrapes)."
+    }
+}
+
+# ================== LISTE ==================
 if ($Charset -eq 'L') { $alpha = [char[]]'abcdefghijklmnopqrstuvwxyz' }
 else                  { $alpha = [char[]]'abcdefghijklmnopqrstuvwxyz0123456789' }
 
@@ -179,11 +232,15 @@ if (Test-Path $listFile) {
     $all = $cur.ToArray()
 }
 
+# ================== REPRISE (les err/timeout ne sont pas marques comme faits) ==================
 $checked = New-Object 'System.Collections.Generic.HashSet[string]'
 if (Test-Path $logFile) {
     foreach ($line in [IO.File]::ReadLines($logFile)) {
         $p = $line.IndexOf([char]9)
-        if ($p -gt 0) { [void]$checked.Add($line.Substring(0, $p)) }
+        if ($p -gt 0) {
+            $st = $line.Substring($p + 1)
+            if ($st -ne 'err' -and $st -ne 'timeout') { [void]$checked.Add($line.Substring(0, $p)) }
+        }
     }
 }
 
@@ -191,18 +248,16 @@ $queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $todo = 0
 foreach ($n in $all) { if (-not $checked.Contains($n)) { $queue.Enqueue($n); $todo++ } }
 
-Write-Host ""
-Write-Host "  Script     : $SCRIPT_VERSION"
-Write-Host "  PowerShell : $($PSVersionTable.PSVersion)"
 Write-Host "  Cible      : $tag   ($($all.Length) pseudos au total)"
 Write-Host "  A verifier : $todo"
 if ($todo -eq 0) { Write-Host "  Tout est deja verifie."; return }
 Write-Host "  Fichier    : $okFile"
-Write-Host "  Ecart base : $DelayMs ms   threads: $Threads   (auto-adapte sur 429)"
+Write-Host "  Reglage    : ecart $DelayMs ms / $Threads threads (auto-adapte)"
+Write-Host "  Plafond    : $HARD_MS ms par requete, jamais plus"
 if ($Webhook) { Write-Host "  Webhook    : actif (thread separe)" } else { Write-Host "  Webhook    : desactive" }
 Write-Host ""
 
-# ---------- etat partage ----------
+# ================== ETAT PARTAGE ==================
 $sync = @{
     lock      = (New-Object System.Object)
     next      = [DateTime]::UtcNow
@@ -211,10 +266,13 @@ $sync = @{
     clean     = 0
     lastAdapt = [DateTime]::UtcNow
     c429      = 0
+    cTimeout  = 0
+    inflight  = 0
+    lastResp  = [DateTime]::UtcNow
     stop      = $false
 }
 
-# ---------- envoi webhook simple (demarrage / fin) ----------
+# ================== WEBHOOK ==================
 function Send-Embed {
     param([string]$Title, [string]$Desc, [int]$Color)
     if (-not $Webhook) { return }
@@ -236,9 +294,9 @@ function Send-Embed {
             $req.Method = 'POST'
             $req.ContentType = 'application/json'
             $req.UserAgent = 'DiscordNameChecker'
-            $req.Timeout = 12000
-            $req.ReadWriteTimeout = 12000
-            $req.Proxy = $null
+            $req.Timeout = 10000
+            $req.ReadWriteTimeout = 10000
+            if ($proxyMode -eq 'system') { $req.Proxy = [System.Net.WebRequest]::GetSystemWebProxy() } else { $req.Proxy = $null }
             $req.ContentLength = $bytes.Length
             $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
             $resp = $null
@@ -257,15 +315,18 @@ function Send-Embed {
                 continue
             }
             break
-        } catch { Start-Sleep -Milliseconds 700 }
+        } catch { Start-Sleep -Milliseconds 600 }
     }
 }
 
-# ---------- thread dedie aux trouvailles : ne bloque jamais la boucle principale ----------
+$results = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+$hits    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+$pending = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+
 $whPS = $null; $whRS = $null; $whHandle = $null
 
 $whSb = {
-    param($hits, $webhook, $sync)
+    param($hits, $webhook, $sync, $pmode)
     $next = [DateTime]::UtcNow
     $item = ''
     while ($true) {
@@ -291,9 +352,9 @@ $whSb = {
                     $req.Method = 'POST'
                     $req.ContentType = 'application/json'
                     $req.UserAgent = 'DiscordNameChecker'
-                    $req.Timeout = 12000
-                    $req.ReadWriteTimeout = 12000
-                    $req.Proxy = $null
+                    $req.Timeout = 10000
+                    $req.ReadWriteTimeout = 10000
+                    if ($pmode -eq 'system') { $req.Proxy = [System.Net.WebRequest]::GetSystemWebProxy() } else { $req.Proxy = $null }
                     $req.ContentLength = $bytes.Length
                     $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
                     $resp = $null
@@ -312,7 +373,7 @@ $whSb = {
                         continue
                     }
                     break
-                } catch { Start-Sleep -Milliseconds 700 }
+                } catch { Start-Sleep -Milliseconds 600 }
             }
             $next = [DateTime]::UtcNow.AddMilliseconds(1400)
         } elseif ([bool]$sync['stop']) {
@@ -325,31 +386,23 @@ $whSb = {
 
 if ($Webhook) { Send-Embed -Title "Demarrage" -Desc "Verification des pseudos **$tag** en cours..." -Color 3447003 }
 
-$results = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-$hits    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-$done    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[int]'
-
 if ($Webhook) {
     $whRS = [runspacefactory]::CreateRunspace()
     $whRS.Open()
     $whPS = [powershell]::Create()
     $whPS.Runspace = $whRS
-    [void]$whPS.AddScript($whSb).AddArgument($hits).AddArgument($Webhook).AddArgument($sync)
+    [void]$whPS.AddScript($whSb).AddArgument($hits).AddArgument($Webhook).AddArgument($sync).AddArgument($proxyMode)
     $whHandle = $whPS.BeginInvoke()
 }
 
-# ---------- moteur ----------
-$pool = [runspacefactory]::CreateRunspacePool(1, $Threads)
-$pool.Open()
-
+# ================== WORKER ==================
 $sb = {
-    param($queue, $results, $hits, $done, $endpoint, $delay, $sync, $ua, $idx)
+    param($queue, $results, $hits, $done, $endpoint, $delay, $sync, $ua, $pmode, $hardms, $idx)
     $lockObj = $sync['lock']
     $item    = ''
     try {
         while ($queue.TryDequeue([ref]$item)) {
 
-            # -- reservation du creneau global (ecart auto-adapte)
             $wait = 0
             [System.Threading.Monitor]::Enter($lockObj)
             try {
@@ -363,7 +416,8 @@ $sb = {
             $name   = $item
             $status = 'err'
 
-            for ($t = 0; $t -lt 6; $t++) {
+            for ($t = 0; $t -lt 3; $t++) {
+                $req = $null
                 try {
                     $bytes = [Text.Encoding]::UTF8.GetBytes('{"username":"' + $name + '"}')
 
@@ -374,18 +428,31 @@ $sb = {
                     $req.Accept = 'application/json'
                     $req.Referer = 'https://discord.com/register'
                     try { $req.Headers.Add('Origin', 'https://discord.com') } catch { }
-                    $req.Timeout = 12000
-                    $req.ReadWriteTimeout = 12000
+                    $req.Timeout = $hardms
+                    $req.ReadWriteTimeout = $hardms
                     $req.KeepAlive = $true
-                    $req.Proxy = $null
+                    if ($pmode -eq 'system') { $req.Proxy = [System.Net.WebRequest]::GetSystemWebProxy() } else { $req.Proxy = $null }
                     $req.ContentLength = $bytes.Length
+
+                    $sync['inflight'] = [int]$sync['inflight'] + 1
 
                     $st = $req.GetRequestStream()
                     $st.Write($bytes, 0, $bytes.Length)
                     $st.Close()
 
+                    # plafond dur : WaitOne puis Abort, impossible de rester pendu
+                    $ar = $req.BeginGetResponse($null, $null)
+                    if (-not $ar.AsyncWaitHandle.WaitOne($hardms + 500)) {
+                        try { $req.Abort() } catch { }
+                        $status = 'timeout'
+                        $sync['cTimeout'] = [int]$sync['cTimeout'] + 1
+                        $sync['inflight'] = [int]$sync['inflight'] - 1
+                        $sync['lastResp'] = [DateTime]::UtcNow
+                        continue
+                    }
+
                     $resp = $null
-                    try { $resp = $req.GetResponse() }
+                    try { $resp = $req.EndGetResponse($ar) }
                     catch [System.Net.WebException] {
                         if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw }
                     }
@@ -400,6 +467,9 @@ $sb = {
                         $resp.Close()
                     }
 
+                    $sync['inflight'] = [int]$sync['inflight'] - 1
+                    $sync['lastResp'] = [DateTime]::UtcNow
+
                     if ($txt -match '"taken"\s*:\s*true')  { $status = 'pris';  break }
                     if ($txt -match '"taken"\s*:\s*false') { $status = 'dispo'; break }
 
@@ -407,7 +477,6 @@ $sb = {
                         $ms = 1200
                         if ($txt -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 200 }
 
-                        # on ralentit l'ecart global (une seule fois par rafale)
                         [System.Threading.Monitor]::Enter($lockObj)
                         try {
                             $n2 = [DateTime]::UtcNow
@@ -429,18 +498,19 @@ $sb = {
                     $status = "http$code"
                     break
                 } catch {
-                    Start-Sleep -Milliseconds 400
+                    try { if ($req) { $req.Abort() } } catch { }
+                    try { $sync['inflight'] = [int]$sync['inflight'] - 1 } catch { }
+                    if ([int]$sync['inflight'] -lt 0) { $sync['inflight'] = 0 }
+                    $sync['lastResp'] = [DateTime]::UtcNow
+                    Start-Sleep -Milliseconds 300
                 }
             }
 
-            # -- accélération progressive quand tout est propre
             $c = [int]$sync['clean'] + 1
             if ($c -ge 400) {
                 $c = 0
                 $g = [int]$sync['gap']
-                if ($g -gt [int]$sync['gapMin']) {
-                    $sync['gap'] = [int][math]::Max([int]$sync['gapMin'], [int]($g * 0.85))
-                }
+                if ($g -gt [int]$sync['gapMin']) { $sync['gap'] = [int][math]::Max([int]$sync['gapMin'], [int]($g * 0.85)) }
             }
             $sync['clean'] = $c
 
@@ -454,69 +524,105 @@ $sb = {
     }
 }
 
-$handles = New-Object System.Collections.ArrayList
-for ($i = 0; $i -lt $Threads; $i++) {
-    $ps = [powershell]::Create()
-    $ps.RunspacePool = $pool
-    [void]$ps.AddScript($sb).AddArgument($queue).AddArgument($results).AddArgument($hits).AddArgument($done).AddArgument($Endpoint).AddArgument($DelayMs).AddArgument($sync).AddArgument($UA).AddArgument($i)
-    try { [void]$handles.Add([pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() }) }
-    catch { $done.Enqueue($i) }
-}
-
-$okW  = New-Object System.IO.StreamWriter($okFile, $true)
-$logW = New-Object System.IO.StreamWriter($logFile, $true)
-
+# ================== BOUCLE DE PASSES ==================
 $processed = 0
 $found     = 0
-$sw        = [Diagnostics.Stopwatch]::StartNew()
-$line      = ''
-$idle      = 0
-$lastDraw  = [DateTime]::MinValue
-$lastTitle = [DateTime]::MinValue
+$okW  = New-Object System.IO.StreamWriter($okFile, $true)
+$logW = New-Object System.IO.StreamWriter($logFile, $true)
 $titreBase = "Checker Discord $tag"
 
 try {
-    while ($done.Count -lt $Threads) {
+    for ($pass = 1; $pass -le 2; $pass++) {
 
-        $n = 0
-        while ($n -lt 6000 -and $results.TryDequeue([ref]$line)) {
-            $p = $line.IndexOf([char]9)
-            $logW.WriteLine($line)
-            if ($p -gt 0 -and $line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
-            $processed++; $n++
-        }
-        if ($n -gt 0) { $logW.Flush(); $okW.Flush() }
-
-        # anti-blocage : si plus rien ne bouge nulle part, on sort
-        if ($queue.Count -eq 0 -and $results.Count -eq 0 -and $hits.Count -eq 0) { $idle++ } else { $idle = 0 }
-        if ($idle -gt 200) { break }
-
-        $spd = $processed / [math]::Max($sw.Elapsed.TotalSeconds, 0.001)
-        $pct = [math]::Round($processed * 100 / $todo, 2)
-        if ($spd -gt 0) { $eta = [TimeSpan]::FromSeconds(($todo - $processed) / $spd).ToString('hh\:mm\:ss') } else { $eta = '--:--:--' }
-        $txt = "  $processed / $todo  ($pct%)   dispo: $found   429: $($sync['c429'])   $([math]::Round($spd,1))/s   ecart: $($sync['gap'])ms   ETA $eta"
-
-        # titre : mise a jour frequente, non bloquee par la selection console
-        $nt = [DateTime]::UtcNow
-        if (($nt - $lastTitle).TotalMilliseconds -ge 400) {
-            $lastTitle = $nt
-            try { [Console]::Title = "$titreBase  |  $pct%  |  $found dispo  |  $([math]::Round($spd,1))/s" } catch { }
+        if ($pass -eq 2) {
+            if ($pending.Count -eq 0) { break }
+            $tmp = ''
+            while ($pending.TryDequeue([ref]$tmp)) { $queue.Enqueue($tmp) }
+            Write-Host ""
+            Write-Host "  --- Passe de rattrapage : $($queue.Count) pseudos en erreur ---"
+            Write-Host ""
         }
 
-        # ligne console : 1 fois par seconde seulement
-        if (($nt - $lastDraw).TotalMilliseconds -ge 1000) {
-            $lastDraw = $nt
-            Write-Host -NoNewline ("`r" + $txt + "        ")
+        $passTotal = $queue.Count
+        if ($passTotal -eq 0) { continue }
+
+        $sync['next']     = [DateTime]::UtcNow
+        $sync['lastResp'] = [DateTime]::UtcNow
+
+        $done = New-Object 'System.Collections.Concurrent.ConcurrentQueue[int]'
+        $pool = [runspacefactory]::CreateRunspacePool(1, $Threads)
+        $pool.Open()
+
+        $handles = New-Object System.Collections.ArrayList
+        for ($i = 0; $i -lt $Threads; $i++) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($sb).AddArgument($queue).AddArgument($results).AddArgument($hits).AddArgument($done).AddArgument($Endpoint).AddArgument($DelayMs).AddArgument($sync).AddArgument($UA).AddArgument($proxyMode).AddArgument($HARD_MS).AddArgument($i)
+            try { [void]$handles.Add([pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() }) }
+            catch { $done.Enqueue($i) }
         }
 
-        Start-Sleep -Milliseconds 120
-    }
+        $passDone = 0
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $line = ''
+        $idle = 0
+        $lastDraw = [DateTime]::MinValue
+        $lastTitle = [DateTime]::MinValue
 
-    while ($results.TryDequeue([ref]$line)) {
-        $p = $line.IndexOf([char]9)
-        $logW.WriteLine($line)
-        if ($p -gt 0 -and $line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
-        $processed++
+        try {
+            while ($done.Count -lt $Threads) {
+
+                $n = 0
+                while ($n -lt 6000 -and $results.TryDequeue([ref]$line)) {
+                    $p = $line.IndexOf([char]9)
+                    $logW.WriteLine($line)
+                    if ($p -gt 0) {
+                        $st = $line.Substring($p + 1)
+                        if ($st -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
+                        elseif ($st -eq 'err' -or $st -eq 'timeout') { $pending.Enqueue($line.Substring(0, $p)) }
+                    }
+                    $processed++; $passDone++; $n++
+                }
+                if ($n -gt 0) { $logW.Flush(); $okW.Flush() }
+
+                if ($queue.Count -eq 0 -and $results.Count -eq 0 -and [int]$sync['inflight'] -eq 0) { $idle++ } else { $idle = 0 }
+                if ($idle -gt 250) { break }
+
+                $spd = $passDone / [math]::Max($sw.Elapsed.TotalSeconds, 0.001)
+                $pct = [math]::Round($passDone * 100 / $passTotal, 2)
+                if ($spd -gt 0) { $eta = [TimeSpan]::FromSeconds(($passTotal - $passDone) / $spd).ToString('hh\:mm\:ss') } else { $eta = '--:--:--' }
+                $age = [int]([DateTime]::UtcNow - [DateTime]$sync['lastResp']).TotalSeconds
+                $txt = "  P$pass  $passDone/$passTotal ($pct%)  dispo:$found  en cours:$($sync['inflight'])  dernier reponse:${age}s  429:$($sync['c429'])  KO:$($sync['cTimeout'])  $([math]::Round($spd,1))/s  ecart:$($sync['gap'])ms  ETA $eta"
+
+                $nt = [DateTime]::UtcNow
+                if (($nt - $lastTitle).TotalMilliseconds -ge 400) {
+                    $lastTitle = $nt
+                    try { [Console]::Title = "$titreBase | P$pass $pct% | $found dispo | $([math]::Round($spd,1))/s" } catch { }
+                }
+                if (($nt - $lastDraw).TotalMilliseconds -ge 1000) {
+                    $lastDraw = $nt
+                    Write-Host -NoNewline ("`r" + $txt + "          ")
+                }
+
+                Start-Sleep -Milliseconds 120
+            }
+
+            while ($results.TryDequeue([ref]$line)) {
+                $p = $line.IndexOf([char]9)
+                $logW.WriteLine($line)
+                if ($p -gt 0) {
+                    $st = $line.Substring($p + 1)
+                    if ($st -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
+                    elseif ($st -eq 'err' -or $st -eq 'timeout') { $pending.Enqueue($line.Substring(0, $p)) }
+                }
+                $processed++; $passDone++
+            }
+        } finally {
+            $logW.Flush(); $okW.Flush()
+            foreach ($h in $handles) { try { [void]$h.PS.EndInvoke($h.H) } catch { }; try { $h.PS.Dispose() } catch { } }
+            try { $pool.Close() } catch { }
+            try { $pool.Dispose() } catch { }
+        }
     }
 } finally {
     $logW.Flush(); $logW.Close(); $okW.Flush(); $okW.Close()
@@ -524,10 +630,6 @@ try {
     $sync['stop'] = $true
     if ($whPS) { try { [void]$whPS.EndInvoke($whHandle) } catch { }; try { $whPS.Dispose() } catch { } }
     if ($whRS) { try { $whRS.Close() } catch { }; try { $whRS.Dispose() } catch { } }
-
-    foreach ($h in $handles) { try { [void]$h.PS.EndInvoke($h.H) } catch { }; try { $h.PS.Dispose() } catch { } }
-    try { $pool.Close() } catch { }
-    try { $pool.Dispose() } catch { }
 }
 
 Write-Host ""
@@ -536,7 +638,7 @@ Write-Host "  Termine : $processed verifies, $found disponibles."
 Write-Host "  Disponibles : $okFile"
 Write-Host "  Journal     : $logFile"
 
-try { [Console]::Title = "$titreBase  |  termine" } catch { }
+try { [Console]::Title = "$titreBase | termine" } catch { }
 
 if ($Webhook) {
     Send-Embed -Title "Termine" -Desc "**$tag** : $processed pseudos verifies, **$found** disponibles." -Color 10181046

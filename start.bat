@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+set "VER=5"
 title Checker pseudo Discord - 3L 3C 4L 4C
 color 0B
 
@@ -14,6 +15,7 @@ cls
 echo.
 echo   ============================================================
 echo     CHECKER DE PSEUDO DISCORD     (sans token, sans proxy)
+echo     start.bat v%VER%
 echo   ============================================================
 echo.
 echo     [1]  3 lettres      (3L)    aaa  ..  zzz
@@ -81,16 +83,28 @@ goto :menu
 :run
 cls
 echo.
-echo   Preparation du script...
+echo   [ start.bat v%VER% ]
+echo.
+echo   Preparation du script PowerShell...
 echo.
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$f='%~f0'; $l=[IO.File]::ReadAllLines($f); $i=[Array]::IndexOf($l,'###PSSTART###'); if($i -lt 0){Write-Host 'marqueur introuvable'; exit 1}; [IO.File]::WriteAllLines('%PS1%', $l[($i+1)..($l.Length-1)])"
+rem --- on efface l'ancien script pour ne jamais relancer une version perimee ---
+if exist "%PS1%" del /f /q "%PS1%" >nul 2>&1
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$f='%~f0'; $l=[IO.File]::ReadAllLines($f); $i=-1; for($k=0;$k -lt $l.Length;$k++){ if($l[$k].Trim() -eq '###PSSTART###'){ $i=$k; break } }; if($i -lt 0){ Write-Host '  EXTRACTION : marqueur ###PSSTART### introuvable'; exit 1 }; [IO.File]::WriteAllLines('%PS1%', $l[($i+1)..($l.Length-1)]); Write-Host ('  EXTRACTION : OK - lignes ' + ($i+1) + ' a ' + $l.Length)"
 
 if not exist "%PS1%" (
-    echo   Erreur : impossible de creer le script PowerShell.
+    echo.
+    echo   ECHEC : le script PowerShell n'a pas pu etre genere.
     pause
     goto :menu
 )
+
+echo.
+echo   --- controle du script genere ---
+findstr /n "SCRIPT_VERSION" "%PS1%"
+echo   --------------------------------
+echo.
 
 if /i "%SET%"=="B" (
     call :check %LEN% L
@@ -124,7 +138,7 @@ param(
     [string]$Endpoint = 'https://discord.com/api/v9/unique-username/username-attempt-unauthed'
 )
 
-$SCRIPT_VERSION = 'v4-httpwebrequest'
+$SCRIPT_VERSION = 'v5-httpwebrequest'
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -178,6 +192,7 @@ foreach ($n in $all) { if (-not $checked.Contains($n)) { $queue.Enqueue($n); $to
 Write-Host ""
 Write-Host "  Script     : $SCRIPT_VERSION"
 Write-Host "  PowerShell : $($PSVersionTable.PSVersion)"
+Write-Host "  Fichier PS : $PSCommandPath"
 Write-Host "  Cible      : $tag   ($($all.Length) pseudos au total)"
 Write-Host "  A verifier : $todo"
 if ($todo -eq 0) { Write-Host "  Tout est deja verifie."; return }

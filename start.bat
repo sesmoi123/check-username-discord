@@ -1,11 +1,11 @@
 @echo off
 setlocal EnableExtensions
-set "VER=5"
+set "VER=6"
 title Checker pseudo Discord - 3L 3C 4L 4C
 color 0B
 
-set "THREADS=4"
-set "DELAY=2000"
+set "THREADS=20"
+set "DELAY=80"
 set "WEBHOOK=https://discord.com/api/webhooks/1545887085351804928/OhHVPWM-XwGM8eWg8mUahPLarLolhkSj_63oNyFr1Q0FDWxROzn5MQG9bDBqsWIIHLee"
 set "PS1=%TEMP%\discord_name_checker.ps1"
 set "OUTDIR=%TEMP%\discord-name-checker"
@@ -26,12 +26,15 @@ echo     [4]  4 lettres      (4L)    aaaa ..  zzzz
 echo     [5]  4 caracteres   (4C)    aaaa ..  9999   (lettres + chiffres)
 echo     [6]  4L + 4C        (les deux, l'un apres l'autre)
 echo.
-echo     [T]  Threads            : %THREADS%
-echo     [D]  Delai entre checks : %DELAY% ms
-echo     [W]  Webhook            : %WEBHOOK%
+echo     [T]  Threads                : %THREADS%
+echo     [D]  Ecart de depart (ms)   : %DELAY%     (0 = plein gaz)
+echo     [W]  Webhook                : %WEBHOOK%
 echo     [O]  Ouvrir le dossier des resultats
 echo     [R]  Repartir de zero (efface la progression)
 echo     [Q]  Quitter
+echo.
+echo   Astuce : si la fenetre se fige, desactive le "Mode selection rapide"
+echo            dans les proprietes de la console (clic droit sur la barre).
 echo.
 set "c="
 set /p "c=   Ton choix : "
@@ -52,13 +55,13 @@ goto :menu
 
 :threads
 set "t="
-set /p "t=   Nombre de threads (1-60) [%THREADS%] : "
+set /p "t=   Nombre de threads (1-64) [%THREADS%] : "
 if not "%t%"=="" set "THREADS=%t%"
 goto :menu
 
 :delay
 set "d="
-set /p "d=   Delai en ms entre 2 verifications [%DELAY%] : "
+set /p "d=   Ecart de depart en ms (0 = plein gaz) [%DELAY%] : "
 if not "%d%"=="" set "DELAY=%d%"
 goto :menu
 
@@ -88,7 +91,6 @@ echo.
 echo   Preparation du script PowerShell...
 echo.
 
-rem --- on efface l'ancien script pour ne jamais relancer une version perimee ---
 if exist "%PS1%" del /f /q "%PS1%" >nul 2>&1
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$f='%~f0'; $l=[IO.File]::ReadAllLines($f); $i=-1; for($k=0;$k -lt $l.Length;$k++){ if($l[$k].Trim() -eq '###PSSTART###'){ $i=$k; break } }; if($i -lt 0){ Write-Host '  EXTRACTION : marqueur ###PSSTART### introuvable'; exit 1 }; [IO.File]::WriteAllLines('%PS1%', $l[($i+1)..($l.Length-1)]); Write-Host ('  EXTRACTION : OK - lignes ' + ($i+1) + ' a ' + $l.Length)"
@@ -132,18 +134,18 @@ exit /b
 param(
     [int]$Length = 3,
     [string]$Charset = 'L',
-    [int]$Threads = 4,
-    [int]$DelayMs = 2000,
+    [int]$Threads = 20,
+    [int]$DelayMs = 80,
     [string]$Webhook = '',
     [string]$Endpoint = 'https://discord.com/api/v9/unique-username/username-attempt-unauthed'
 )
 
-$SCRIPT_VERSION = 'v5-httpwebrequest'
+$SCRIPT_VERSION = 'v6-adaptive'
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::Expect100Continue = $false
-[Net.ServicePointManager]::DefaultConnectionLimit = 100
+[Net.ServicePointManager]::DefaultConnectionLimit = 200
 [Net.WebRequest]::DefaultWebProxy = $null
 
 if ($Threads -lt 1) { $Threads = 1 }
@@ -192,27 +194,32 @@ foreach ($n in $all) { if (-not $checked.Contains($n)) { $queue.Enqueue($n); $to
 Write-Host ""
 Write-Host "  Script     : $SCRIPT_VERSION"
 Write-Host "  PowerShell : $($PSVersionTable.PSVersion)"
-Write-Host "  Fichier PS : $PSCommandPath"
 Write-Host "  Cible      : $tag   ($($all.Length) pseudos au total)"
 Write-Host "  A verifier : $todo"
 if ($todo -eq 0) { Write-Host "  Tout est deja verifie."; return }
 Write-Host "  Fichier    : $okFile"
-Write-Host "  Cadence    : 1 verification toutes les $DelayMs ms  (threads: $Threads)"
-if ($Webhook) { Write-Host "  Webhook    : actif" } else { Write-Host "  Webhook    : desactive" }
+Write-Host "  Ecart base : $DelayMs ms   threads: $Threads   (auto-adapte sur 429)"
+if ($Webhook) { Write-Host "  Webhook    : actif (thread separe)" } else { Write-Host "  Webhook    : desactive" }
 Write-Host ""
 
-# ---------- webhook ----------
-$script:nextSend = [DateTime]::UtcNow
+# ---------- etat partage ----------
+$sync = @{
+    lock      = (New-Object System.Object)
+    next      = [DateTime]::UtcNow
+    gap       = $DelayMs
+    gapMin    = 20
+    clean     = 0
+    lastAdapt = [DateTime]::UtcNow
+    c429      = 0
+    stop      = $false
+}
 
+# ---------- envoi webhook simple (demarrage / fin) ----------
 function Send-Embed {
     param([string]$Title, [string]$Desc, [int]$Color)
     if (-not $Webhook) { return }
-
-    $gap = ($script:nextSend - [DateTime]::UtcNow).TotalMilliseconds
-    if ($gap -gt 0) { Start-Sleep -Milliseconds ([int]$gap) }
-
     $payload = @{
-        content = "**$Title** disponible"
+        content = "**$Title**"
         embeds  = @(@{
             title       = $Title
             description = $Desc
@@ -222,63 +229,117 @@ function Send-Embed {
         })
     } | ConvertTo-Json -Depth 6 -Compress
 
-    for ($t = 0; $t -lt 5; $t++) {
+    for ($t = 0; $t -lt 4; $t++) {
         try {
             $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
             $req = [System.Net.HttpWebRequest]::Create($Webhook)
             $req.Method = 'POST'
             $req.ContentType = 'application/json'
             $req.UserAgent = 'DiscordNameChecker'
-            $req.Timeout = 20000
-            $req.ReadWriteTimeout = 20000
-            $req.KeepAlive = $false
+            $req.Timeout = 12000
+            $req.ReadWriteTimeout = 12000
             $req.Proxy = $null
             $req.ContentLength = $bytes.Length
-
-            $st = $req.GetRequestStream()
-            $st.Write($bytes, 0, $bytes.Length)
-            $st.Close()
-
+            $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
             $resp = $null
             try { $resp = $req.GetResponse() }
-            catch [System.Net.WebException] {
-                if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw }
-            }
-
-            $code = 0
-            $body = ''
+            catch [System.Net.WebException] { if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw } }
+            $code = 0; $body = ''
             if ($resp) {
                 $code = [int]$resp.StatusCode
                 $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
-                $body = $sr.ReadToEnd()
-                $sr.Close()
-                $resp.Close()
+                $body = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
             }
-
             if ($code -eq 429) {
-                $ms = 2500
+                $ms = 2000
                 if ($body -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 300 }
                 Start-Sleep -Milliseconds $ms
                 continue
             }
             break
-        } catch {
-            Start-Sleep -Milliseconds 800
+        } catch { Start-Sleep -Milliseconds 700 }
+    }
+}
+
+# ---------- thread dedie aux trouvailles : ne bloque jamais la boucle principale ----------
+$whPS = $null; $whRS = $null; $whHandle = $null
+
+$whSb = {
+    param($hits, $webhook, $sync)
+    $next = [DateTime]::UtcNow
+    $item = ''
+    while ($true) {
+        if ($hits.TryDequeue([ref]$item)) {
+            $gap = ($next - [DateTime]::UtcNow).TotalMilliseconds
+            if ($gap -gt 0) { Start-Sleep -Milliseconds ([int]$gap) }
+
+            $payload = @{
+                content = "**$item** disponible"
+                embeds  = @(@{
+                    title       = $item
+                    description = "Pseudo disponible : **$item**"
+                    color       = 5763719
+                    timestamp   = (Get-Date).ToUniversalTime().ToString('o')
+                    footer      = @{ text = "Discord Name Checker" }
+                })
+            } | ConvertTo-Json -Depth 6 -Compress
+
+            for ($t = 0; $t -lt 5; $t++) {
+                try {
+                    $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+                    $req = [System.Net.HttpWebRequest]::Create($webhook)
+                    $req.Method = 'POST'
+                    $req.ContentType = 'application/json'
+                    $req.UserAgent = 'DiscordNameChecker'
+                    $req.Timeout = 12000
+                    $req.ReadWriteTimeout = 12000
+                    $req.Proxy = $null
+                    $req.ContentLength = $bytes.Length
+                    $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
+                    $resp = $null
+                    try { $resp = $req.GetResponse() }
+                    catch [System.Net.WebException] { if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw } }
+                    $code = 0; $body = ''
+                    if ($resp) {
+                        $code = [int]$resp.StatusCode
+                        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                        $body = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
+                    }
+                    if ($code -eq 429) {
+                        $ms = 2000
+                        if ($body -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 300 }
+                        Start-Sleep -Milliseconds $ms
+                        continue
+                    }
+                    break
+                } catch { Start-Sleep -Milliseconds 700 }
+            }
+            $next = [DateTime]::UtcNow.AddMilliseconds(1400)
+        } elseif ([bool]$sync['stop']) {
+            break
+        } else {
+            Start-Sleep -Milliseconds 120
         }
     }
-    $script:nextSend = [DateTime]::UtcNow.AddSeconds(2)
 }
 
 if ($Webhook) { Send-Embed -Title "Demarrage" -Desc "Verification des pseudos **$tag** en cours..." -Color 3447003 }
 
-# ---------- regulateur global : 1 requete toutes les DelayMs ----------
-$sync = @{ lock = (New-Object System.Object); next = [DateTime]::UtcNow }
-
-# ---------- moteur ----------
 $results = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $hits    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $done    = New-Object 'System.Collections.Concurrent.ConcurrentQueue[int]'
-$pool    = [runspacefactory]::CreateRunspacePool(1, $Threads)
+
+if ($Webhook) {
+    $whRS = [runspacefactory]::CreateRunspace()
+    $whRS.Open()
+    $whPS = [powershell]::Create()
+    $whPS.Runspace = $whRS
+    [void]$whPS.AddScript($whSb).AddArgument($hits).AddArgument($Webhook).AddArgument($sync)
+    $whHandle = $whPS.BeginInvoke()
+}
+
+# ---------- moteur ----------
+$pool = [runspacefactory]::CreateRunspacePool(1, $Threads)
 $pool.Open()
 
 $sb = {
@@ -288,21 +349,21 @@ $sb = {
     try {
         while ($queue.TryDequeue([ref]$item)) {
 
-            # -- reservation du creneau : exactement 1 envoi toutes les $delay ms
+            # -- reservation du creneau global (ecart auto-adapte)
             $wait = 0
             [System.Threading.Monitor]::Enter($lockObj)
             try {
                 $now = [DateTime]::UtcNow
                 $nxt = [DateTime]$sync['next']
                 if ($nxt -gt $now) { $wait = [int](($nxt - $now).TotalMilliseconds) }
-                $sync['next'] = $now.AddMilliseconds($wait + $delay)
+                $sync['next'] = $now.AddMilliseconds($wait + [int]$sync['gap'])
             } finally { [System.Threading.Monitor]::Exit($lockObj) }
             if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
 
             $name   = $item
             $status = 'err'
 
-            for ($t = 0; $t -lt 8; $t++) {
+            for ($t = 0; $t -lt 6; $t++) {
                 try {
                     $bytes = [Text.Encoding]::UTF8.GetBytes('{"username":"' + $name + '"}')
 
@@ -313,9 +374,9 @@ $sb = {
                     $req.Accept = 'application/json'
                     $req.Referer = 'https://discord.com/register'
                     try { $req.Headers.Add('Origin', 'https://discord.com') } catch { }
-                    $req.Timeout = 25000
-                    $req.ReadWriteTimeout = 25000
-                    $req.KeepAlive = $false
+                    $req.Timeout = 12000
+                    $req.ReadWriteTimeout = 12000
+                    $req.KeepAlive = $true
                     $req.Proxy = $null
                     $req.ContentLength = $bytes.Length
 
@@ -343,18 +404,45 @@ $sb = {
                     if ($txt -match '"taken"\s*:\s*false') { $status = 'dispo'; break }
 
                     if ($code -eq 429) {
-                        $ms = 1500
-                        if ($txt -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 250 }
+                        $ms = 1200
+                        if ($txt -match '"retry_after"\s*:\s*([0-9.]+)') { $ms = [int]([double]$matches[1] * 1000) + 200 }
+
+                        # on ralentit l'ecart global (une seule fois par rafale)
+                        [System.Threading.Monitor]::Enter($lockObj)
+                        try {
+                            $n2 = [DateTime]::UtcNow
+                            if (($n2 - [DateTime]$sync['lastAdapt']).TotalSeconds -gt 1.0) {
+                                $g = [int]$sync['gap']
+                                if ($g -lt 40) { $g = 40 }
+                                $sync['gap'] = [int][math]::Min(3000, [int]($g * 1.7))
+                                $sync['lastAdapt'] = $n2
+                                $sync['clean'] = 0
+                            }
+                            $sync['c429'] = [int]$sync['c429'] + 1
+                        } finally { [System.Threading.Monitor]::Exit($lockObj) }
+
                         Start-Sleep -Milliseconds $ms
                         continue
                     }
+
                     if ($code -eq 200) { $status = 'dispo'; break }
                     $status = "http$code"
                     break
                 } catch {
-                    Start-Sleep -Milliseconds 700
+                    Start-Sleep -Milliseconds 400
                 }
             }
+
+            # -- accélération progressive quand tout est propre
+            $c = [int]$sync['clean'] + 1
+            if ($c -ge 400) {
+                $c = 0
+                $g = [int]$sync['gap']
+                if ($g -gt [int]$sync['gapMin']) {
+                    $sync['gap'] = [int][math]::Max([int]$sync['gapMin'], [int]($g * 0.85))
+                }
+            }
+            $sync['clean'] = $c
 
             if ($status -eq 'dispo') { $hits.Enqueue($name) }
             $results.Enqueue($name + [char]9 + $status)
@@ -382,12 +470,16 @@ $processed = 0
 $found     = 0
 $sw        = [Diagnostics.Stopwatch]::StartNew()
 $line      = ''
-$hitName   = ''
+$idle      = 0
+$lastDraw  = [DateTime]::MinValue
+$lastTitle = [DateTime]::MinValue
+$titreBase = "Checker Discord $tag"
 
 try {
     while ($done.Count -lt $Threads) {
+
         $n = 0
-        while ($n -lt 4000 -and $results.TryDequeue([ref]$line)) {
+        while ($n -lt 6000 -and $results.TryDequeue([ref]$line)) {
             $p = $line.IndexOf([char]9)
             $logW.WriteLine($line)
             if ($p -gt 0 -and $line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
@@ -395,28 +487,44 @@ try {
         }
         if ($n -gt 0) { $logW.Flush(); $okW.Flush() }
 
-        # un embed par pseudo trouve, espace de 2 s (limite webhook Discord)
-        if ($hits.TryDequeue([ref]$hitName)) {
-            Send-Embed -Title $hitName -Desc "Pseudo disponible : **$hitName**" -Color 5763719
+        # anti-blocage : si plus rien ne bouge nulle part, on sort
+        if ($queue.Count -eq 0 -and $results.Count -eq 0 -and $hits.Count -eq 0) { $idle++ } else { $idle = 0 }
+        if ($idle -gt 200) { break }
+
+        $spd = $processed / [math]::Max($sw.Elapsed.TotalSeconds, 0.001)
+        $pct = [math]::Round($processed * 100 / $todo, 2)
+        if ($spd -gt 0) { $eta = [TimeSpan]::FromSeconds(($todo - $processed) / $spd).ToString('hh\:mm\:ss') } else { $eta = '--:--:--' }
+        $txt = "  $processed / $todo  ($pct%)   dispo: $found   429: $($sync['c429'])   $([math]::Round($spd,1))/s   ecart: $($sync['gap'])ms   ETA $eta"
+
+        # titre : mise a jour frequente, non bloquee par la selection console
+        $nt = [DateTime]::UtcNow
+        if (($nt - $lastTitle).TotalMilliseconds -ge 400) {
+            $lastTitle = $nt
+            try { [Console]::Title = "$titreBase  |  $pct%  |  $found dispo  |  $([math]::Round($spd,1))/s" } catch { }
         }
 
-        $pct = [math]::Round($processed * 100 / $todo, 2)
-        $spd = [math]::Round($processed / [math]::Max($sw.Elapsed.TotalSeconds, 0.001), 1)
-        if ($spd -gt 0) { $eta = [TimeSpan]::FromSeconds(($todo - $processed) / $spd).ToString('hh\:mm\:ss') } else { $eta = '--:--:--' }
-        Write-Host -NoNewline ("`r  {0} / {1}  ({2}%)   dispo: {3}   {4}/s   ETA {5}        " -f $processed, $todo, $pct, $found, $spd, $eta)
-        Start-Sleep -Milliseconds 250
+        # ligne console : 1 fois par seconde seulement
+        if (($nt - $lastDraw).TotalMilliseconds -ge 1000) {
+            $lastDraw = $nt
+            Write-Host -NoNewline ("`r" + $txt + "        ")
+        }
+
+        Start-Sleep -Milliseconds 120
     }
+
     while ($results.TryDequeue([ref]$line)) {
         $p = $line.IndexOf([char]9)
         $logW.WriteLine($line)
         if ($p -gt 0 -and $line.Substring($p + 1) -eq 'dispo') { $okW.WriteLine($line.Substring(0, $p)); $found++ }
         $processed++
     }
-    while ($hits.TryDequeue([ref]$hitName)) {
-        Send-Embed -Title $hitName -Desc "Pseudo disponible : **$hitName**" -Color 5763719
-    }
 } finally {
     $logW.Flush(); $logW.Close(); $okW.Flush(); $okW.Close()
+
+    $sync['stop'] = $true
+    if ($whPS) { try { [void]$whPS.EndInvoke($whHandle) } catch { }; try { $whPS.Dispose() } catch { } }
+    if ($whRS) { try { $whRS.Close() } catch { }; try { $whRS.Dispose() } catch { } }
+
     foreach ($h in $handles) { try { [void]$h.PS.EndInvoke($h.H) } catch { }; try { $h.PS.Dispose() } catch { } }
     try { $pool.Close() } catch { }
     try { $pool.Dispose() } catch { }
@@ -427,6 +535,8 @@ Write-Host ""
 Write-Host "  Termine : $processed verifies, $found disponibles."
 Write-Host "  Disponibles : $okFile"
 Write-Host "  Journal     : $logFile"
+
+try { [Console]::Title = "$titreBase  |  termine" } catch { }
 
 if ($Webhook) {
     Send-Embed -Title "Termine" -Desc "**$tag** : $processed pseudos verifies, **$found** disponibles." -Color 10181046
